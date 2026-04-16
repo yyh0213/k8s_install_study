@@ -1,8 +1,10 @@
 # Ubuntu 22.04 LTS 멀티 노드 K8s 클러스터 + GPU 세팅 가이드
 
-> **환경**: Ubuntu 22.04.5 LTS (Jammy Jellyfish)  
-> **구성**: Master Node 1대 + GPU Worker Node N대  
-> **표기**: `[ALL]` = 모든 노드, `[MASTER]` = Master 노드만, `[WORKER-GPU]` = GPU 장착 Worker 노드만
+> **테스트 환경 (Verified Version)**
+> - **OS**: Ubuntu 22.04.5 LTS (Jammy Jellyfish)
+> - **Kubernetes**: v1.32.x
+> - **Container Runtime**: containerd v2.x
+> - **GPU Driver**: NVIDIA Container Toolkit v1.15+
 
 ---
 
@@ -112,17 +114,22 @@ sudo apt-get update
 sudo apt-get install -y nvidia-container-toolkit
 ```
 
-### 3-3. Containerd에 NVIDIA 런타임 등록
+### 3-3. Containerd에 NVIDIA 런타임 강제 등록 (핵심 ⭐)
+
+가장 에러가 많이 발생하는 구간입니다. 설정을 초기화한 후 확실하게 등록해야 합니다.
 
 ```bash
-# Containerd가 NVIDIA GPU를 사용할 수 있도록 설정
-sudo nvidia-ctk runtime configure --runtime=containerd
+# 1. containerd 설정을 기본값으로 초기화
+sudo rm -f /etc/containerd/config.toml
+containerd config default | sudo tee /etc/containerd/config.toml
 
-# /etc/containerd/config.toml 에서 default_runtime_name을 확인/수정
-# nvidia-ctk 명령이 자동으로 설정하지만, 아래 명령으로 검증
-grep -A2 'default_runtime_name' /etc/containerd/config.toml
+# 2. NVIDIA 런타임을 기본(Default)으로 자동 설정
+sudo nvidia-ctk runtime configure --runtime=containerd --set-as-default
 
-# Containerd 재시작
+# 3. 쿠버네티스 Cgroup 드라이버(systemd) 활성화
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# 4. 서비스 재시작
 sudo systemctl restart containerd
 ```
 
@@ -156,11 +163,11 @@ sudo systemctl enable --now kubelet
 ## 🏗️ 5단계: 클러스터 초기화 `[MASTER]`
 
 > [!IMPORTANT]
-> Master 노드에서만 실행합니다. `--pod-network-cidr`은 Calico CNI 기본값입니다. 변경 시 이후 Calico 설정도 함께 변경해야 합니다.
+> Master 노드에서만 실행합니다. `--pod-network-cidr`은 Calico CNI 기본값입니다.
 
 ```bash
 # Master 노드 IP를 변수에 저장 (실제 Master 노드 IP로 변경)
-MASTER_IP="<Master 노드의 내부 IP 주소>"
+MASTER_IP="192.168.1.153" # 이미 설정되어 있다면 패스
 
 sudo kubeadm init \
   --apiserver-advertise-address=${MASTER_IP} \
@@ -168,7 +175,9 @@ sudo kubeadm init \
   --cri-socket=unix:///run/containerd/containerd.sock
 ```
 
-### 5-1. kubectl 설정 (Master 노드 일반 사용자 계정용)
+### 5-1. kubectl 설정 (필수 ⭐)
+
+초기화 성공 후, 현재 로그인한 사용자 계정에서 `kubectl`을 사용할 수 있게 권한을 가져옵니다.
 
 ```bash
 mkdir -p $HOME/.kube
@@ -176,89 +185,102 @@ sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 ```
 
-### 5-2. 클러스터 상태 확인
+---
+
+## 🛣️ 6단계: 구성 시나리오 선택
+
+서버 환경에 따라 아래 **A** 또는 **B** 중 하나를 선택하여 진행하세요.
+
+### **[시나리오 A] 서버 1대만 사용하는 경우 (단일 노드)**
+마스터 노드에서도 파드(Pod)가 실행될 수 있도록 스케줄링 제한을 해제합니다. (v1.24+ 기준)
 
 ```bash
-kubectl get nodes
-# STATUS가 NotReady인 것은 정상 - CNI 설치 전이기 때문
+# 마스터 노드에서도 워크로드 실행 허용 (Taint 제거)
+kubectl taint nodes --all node-role.kubernetes.io/control-plane-
 ```
+
+### **[시나리오 B] 서버 여러 대를 연결하는 경우 (다중 노드)**
+다른 서버(Worker)들을 마스터에 연결합니다.
+
+1. **Worker 노드에서 실행**: `kubeadm init` 완료 시 출력된 `join` 명령어를 입력합니다.
+   ```bash
+   sudo kubeadm join <Master-IP>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+   ```
+2. **Master 노드에서 확인**:
+   ```bash
+   kubectl get nodes
+   ```
 
 ---
 
-## 🌐 6단계: 네트워크 플러그인(CNI) 설치 - Calico `[MASTER]`
+## 🌐 7단계: 네트워크 플러그인(CNI) 설치 `[MASTER]`
+
+단일/다중 노드 상관없이 반드시 설치해야 합니다.
 
 ```bash
 # Calico 설치
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
 
-# Pod가 Running 상태가 될 때까지 대기 (약 1-2분 소요)
+# 상태 확인 (모든 Pod가 Running이 될 때까지 대기)
 watch kubectl get pods -n kube-system
-
-# Node 상태가 Ready로 변경된 것 확인
-kubectl get nodes
 ```
 
 ---
 
-## 🔗 7단계: Worker 노드 클러스터 조인 `[WORKER-GPU]`
+## 🎮 8단계: NVIDIA GPU Device Plugin 배포 `[MASTER]`
 
-`kubeadm init` 완료 시 출력된 `kubeadm join` 명령어를 각 Worker 노드에서 실행합니다.
-
-```bash
-# 아래는 예시 형식 - 실제 init 완료 시 터미널에 출력된 명령어를 복사해서 사용
-sudo kubeadm join <Master-IP>:6443 \
-  --token <token> \
-  --discovery-token-ca-cert-hash sha256:<hash>
-```
-
-> [!NOTE]
-> join 토큰을 분실했을 경우, Master에서 아래 명령어로 새 토큰을 발급할 수 있습니다.
-> ```bash
-> kubeadm token create --print-join-command
-> ```
-
-### 조인 확인 (Master에서)
+K8s 클러스터가 GPU를 자원으로 인식하게 만드는 최종 단계입니다.
 
 ```bash
-kubectl get nodes
-# 모든 노드가 Ready 상태인지 확인
-```
-
----
-
-## 🏷️ 8단계: GPU 노드 라벨링 `[MASTER]`
-
-```bash
-# GPU가 있는 Worker 노드에 레이블 추가 (노드 이름은 kubectl get nodes로 확인)
-kubectl label nodes <gpu-worker-node-name> accelerator=nvidia-gpu
-
-# 확인
-kubectl get nodes --show-labels
-```
-
----
-
-## 🎯 9단계: NVIDIA Device Plugin 배포 `[MASTER]`
-
-이 단계에서 쿠버네티스 스케줄러가 GPU를 자원으로 인식하게 됩니다.
-
-```bash
+# NVIDIA Device Plugin 배포
 kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml
 
-# DaemonSet 상태 확인 (GPU 노드 수만큼 Pod가 Running이어야 함)
-kubectl get pods -n kube-system | grep nvidia
+# GPU 인식 확인
+kubectl describe node | grep -A20 "Capacity"
+# nvidia.com/gpu: <갯수> 가 보이면 성공!
 ```
 
-### GPU 자원 인식 확인
+---
 
+## 🖥️ 9단계: Lens를 이용한 GUI 관리 (추천 ⭐)
+
+CLI(명령어)가 익숙지 않다면, 시각적으로 클러스터를 관리할 수 있는 **Lens** 사용을 강력히 추천합니다. 서버에 따로 무거운 프로그램을 깔지 않아도 됩니다.
+
+### 1. 내 PC에 Lens 설치
+1. [Lens 홈페이지](https://k8slens.dev/)에 접속하여 OS(Windows/Mac)에 맞는 버전을 다운로드하고 설치합니다. (개인용 Personal 버전은 무료입니다.)
+
+### 2. 접속 설정 파일(kubeconfig) 가져오기
+서버의 접속 정보를 내 PC로 가져와야 합니다.
+1. 마스터 노드 터미널에서 아래 명령어로 설정 파일 내용을 출력합니다.
+   ```bash
+   cat ~/.kube/config
+   ```
+2. 출력된 텍스트 전체를 복사합니다.
+
+### 3. Lens에 클러스터 등록
+1. Lens 앱을 실행합니다.
+2. 좌측 트리에서 KUBERNETES CLUSTERS - Local Kuberconfigs 우측에 마우스를 올리면 + 버튼이 보입니다. 클릭합니다.
+3. add Kubeconfig를 선택합니다.
+4. 아까 cat ~/.kube/config로 복사했던 정보를 붙여 넣습니다.
+5. **Connect**를 누르면 서버의 CPU, 메모리, GPU 사용량과 Pod 리스트를 실시간 GUI로 볼 수 있습니다.
+
+---
+
+## 💡 팁: 유용한 명령어 모음
+
+### 모든 Pod 상태 확인 (모든 네임스페이스)
 ```bash
-# GPU 노드 상세 정보 확인
-kubectl describe node <gpu-worker-node-name> | grep -A5 "Capacity"
+kubectl get pods -A
+```
 
-# 아래와 같이 출력되면 성공!
-# Capacity:
-#   ...
-#   nvidia.com/gpu: 2   <-- GPU 갯수
+### 서비스 로그 실시간 확인
+```bash
+kubectl logs -f <pod-name>
+```
+
+### Pod에 접속해서 Bash 띄우기
+```bash
+kubectl exec -it <pod-name> -- /bin/bash
 ```
 
 ---
@@ -315,6 +337,47 @@ Done
 
 ---
 
+---
+
+## 🔐 11단계: 사내 비공개 레지스트리(Harbor) 연동
+
+Harbor는 비공개 서버이므로, 쿠버네티스가 이미지를 가져올 때 **"로그인 정보(열쇠)"**가 필요합니다. 이 설정이 없으면 `ImagePullBackOff` 에러가 발생합니다.
+
+### 1. Harbor 로그인 정보 Secret 생성
+쿠버네티스 클러스터에서 사용할 수 있는 로그인 열쇠를 생성합니다.
+
+```bash
+kubectl create secret docker-registry harbor-registry-secret \
+  --docker-server=<HARBOR_URL> \
+  --docker-username=<USER> \
+  --docker-password=<PASSWORD>
+```
+*   `harbor-registry-secret`: 내가 정한 Secret의 이름입니다.
+*   `<HARBOR_URL>`: 사내 Harbor 주소 (예: harbor.company.com)
+
+### 2. YAML 파일에 열쇠 명시하기
+파드 정의 시 아래와 같이 `imagePullSecrets`를 명시해야 해당 열쇠를 써서 이미지를 가져옵니다.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-ai-app
+spec:
+  # 생성한 Secret 이름을 여기에 명시합니다 ⭐
+  imagePullSecrets:
+  - name: harbor-registry-secret
+  containers:
+  - name: ai-container
+    # Harbor 주소가 포함된 이미지 경로를 사용합니다
+    image: <HARBOR_URL>/project-name/image-name:tag
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+---
+
 ## 📦 선택: kube-proxy 없이 더 강력한 네트워크를 원한다면
 
 Calico 대신 **Cilium** CNI를 사용하면 eBPF 기반의 더 빠른 네트워크와 강력한 네트워크 정책을 사용할 수 있습니다. GPU AI 워크로드에서 많이 사용합니다.
@@ -324,4 +387,65 @@ Calico 대신 **Cilium** CNI를 사용하면 eBPF 기반의 더 빠른 네트워
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 helm repo add cilium https://helm.cilium.io/
 helm install cilium cilium/cilium --version 1.15.5 --namespace kube-system
+```
+
+---
+
+## 📚 부록: 실전 Pod 작성 치트 시트 (Cheat Sheet)
+
+실무에서 자주 쓰이는 파드 설정 패턴들을 정리합니다.
+
+### 1. 컨테이너를 죽지 않게 유지하기 (Keep-alive)
+AI 모델 학습이나 전처리용 파드는 작업이 끝나면 바로 종료됩니다. 내부 접속 후 디버깅을 하거나 코드를 수정하려면 컨테이너를 계속 켜둬야 합니다.
+*   **패턴**: `command`와 `args`에 무한 대기 명령어를 넣습니다.
+```yaml
+containers:
+- name: preprocessing
+  image: <HARBOR_URL>/ai-team/preprocessing:latest
+  command: ["/bin/sh", "-c"]
+  args: ["tail -f /dev/null"] # 이 명령어가 파드를 무한 대기 상태로 유지합니다.
+```
+
+### 2. 호스트 폴더 연결하기 (Volume Mount)
+서버의 특정 폴더(예: NAS 마운트 지점, 데이터셋 폴더)를 파드 내부로 연결할 때 사용합니다.
+```yaml
+spec:
+  volumes:
+  - name: dataset-storage
+    hostPath:
+      path: /mnt/nas/data # 실제 서버(Host)의 경로
+  containers:
+  - name: worker
+    volumeMounts:
+    - name: dataset-storage
+      mountPath: /data # 파드 내부에서 접근할 경로
+```
+
+### 3. 외부 브라우저에서 접속 가능하게 만들기 (Service)
+파드 안에서 띄운 웹 서버(예: Jupyter Notebook, Flask)를 내 PC 브라우저에서 접속하고 싶을 때 사용합니다.
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-web-service
+spec:
+  type: NodePort
+  ports:
+  - port: 80         # 파드 내부용 포트
+    targetPort: 8888 # 컨테이너 앱 포트 (예: Jupyter)
+    nodePort: 30005  # 사용자 접속 포트 (서버IP:30005 로 접속)
+  selector:
+    name: preprocessing # 파드의 metadata.name과 일치해야 함
+```
+
+### 4. 환경 변수 동적 설정 (Environment Variables)
+코드 수정 없이 학습 파라미터 등을 바꿀 때 유용합니다.
+```yaml
+containers:
+- name: training-pod
+  env:
+  - name: LEARNING_RATE
+    value: "0.001"
+  - name: BATCH_SIZE
+    value: "64"
 ```
