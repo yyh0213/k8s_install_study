@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nas3.10-models-pvc         # 파드(Pod)에서 이 저장소를 부를 때 사용할 이름
+  namespace: default               # 이 신청서가 유효한 구역 (네임스페이스)
+spec:
+  accessModes:
+    - ReadWriteMany                # 주의 ⚠️: PV가 ReadOnlyMany이므로, 실제로는 읽기만 가능할 확률이 높음
+                                   # 보통 PV의 accessModes와 일치시키는 것이 정석입니다.
+  resources:
+    requests:
+      storage: 100Ti               # 내가 이 저장소에서 빌려 쓰고 싶은 용량
+  volumeName: nas3.10-models-pv    # 중요 ⭐: 특정 PV를 직접 지정하여 '수동 바인딩(정적 바인딩)' 함
+                                   # (사용자님이 적으신 nas3.10-nfs-pv에서 이름을 수정했습니다.)
+  storageClassName: ""             # 빈 문자열: '자동 생성기'를 쓰지 않고, 관리자가 만든 PV를 직접 쓰겠다는 의미
