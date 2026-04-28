@@ -145,6 +145,21 @@ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/conf
 sudo systemctl restart containerd
 ```
 
+### 3-4. 설정 검증 (필수 ⭐)
+
+다음 단계로 넘어가기 전에 설정 파일(`config.toml`)이 정상적으로 수정되었는지 반드시 확인하세요.
+
+```bash
+# 1. SystemdCgroup 정상 변경 여부 확인
+grep 'SystemdCgroup = true' /etc/containerd/config.toml
+# 정상이라면 콘솔에 'SystemdCgroup = true' 가 출력되어야 합니다.
+
+# 2. NVIDIA 런타임 정상 등록 여부 확인
+grep -i 'containerd.runtimes.nvidia' /etc/containerd/config.toml
+# 정상이라면 '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]' 같은 줄이 포함되어 출력되어야 합니다.
+# (만약 위 두 명령어 중 하나라도 아무런 출력이 나오지 않는다면, 3-3 단계를 다시 천천히 실행해 주세요.)
+```
+
 ---
 
 ## ☸️ 4단계: Kubeadm / Kubelet / Kubectl 설치 `[ALL]`
