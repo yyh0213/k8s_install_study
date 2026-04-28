@@ -5,7 +5,7 @@
 > - **Kubernetes**: v1.32.x
 > - **Container Runtime**: containerd v2.x
 > - **GPU Driver**: NVIDIA Container Toolkit v1.15+
-
+> - **NVIDIA Driver**: 550.x
 ---
 
 ## ✅ 1단계: 사전 준비 `[ALL]`
@@ -129,19 +129,28 @@ sudo apt-get install -y nvidia-container-toolkit
 ### 3-3. Containerd에 NVIDIA 런타임 강제 등록 (핵심 ⭐)
 
 가장 에러가 많이 발생하는 구간입니다. 설정을 초기화한 후 확실하게 등록해야 합니다.
-
+최신 nvidia-ctk는 메인 설정 파일(config.toml)을 직접 덮어쓰지 않고, conf.d 디렉토리에 분할 설정 파일(Drop-in)을 생성하는 방식을 사용합니다.
 ```bash
-# 1. containerd 설정을 기본값으로 초기화
+# 1. containerd 설정을 기본값으로 초기화 및 conf.d 디렉토리 활성화
 sudo rm -f /etc/containerd/config.toml
 containerd config default | sudo tee /etc/containerd/config.toml
 
-# 2. NVIDIA 런타임을 기본(Default)으로 자동 설정
-sudo nvidia-ctk runtime configure --runtime=containerd --set-as-default
+# 2. config.toml 파일에 imports 구문이 있는지 확인 및 추가 (중요)
+# 최신 containerd는 보통 기본 포함되어 있으나, 확실히 하기 위해 실행합니다.
+if ! grep -q 'imports = \["/etc/containerd/conf.d/\*.toml"\]' /etc/containerd/config.toml; then
+  sudo sed -i '1s/^/imports = ["\/etc\/containerd\/conf.d\/*.toml"]\n/' /etc/containerd/config.toml
+fi
 
-# 3. 쿠버네티스 Cgroup 드라이버(systemd) 활성화
+# 3. conf.d 디렉토리 생성
+sudo mkdir -p /etc/containerd/conf.d
+
+# 4. NVIDIA 런타임 설정 주입 (conf.d/99-nvidia.toml 파일로 생성됨)
+sudo nvidia-ctk runtime configure --runtime=containerd
+
+# 5. 쿠버네티스 Cgroup 드라이버(systemd) 활성화
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 
-# 4. 서비스 재시작
+# 6. 서비스 재시작
 sudo systemctl restart containerd
 ```
 
@@ -154,14 +163,15 @@ sudo systemctl restart containerd
 grep 'SystemdCgroup = true' /etc/containerd/config.toml
 # 정상이라면 콘솔에 'SystemdCgroup = true' 가 출력되어야 합니다.
 
-# 2. NVIDIA 런타임 정상 등록 여부 확인
-grep -i 'containerd.runtimes.nvidia' /etc/containerd/config.toml
+# 2. 외부 설정 파일 Import 구문 확인
+head -n 5 /etc/containerd/config.toml | grep 'imports'
+# 정상이라면 'imports = ["/etc/containerd/conf.d/*.toml"]' 이 출력되어야 합니다.
 
-# [v2.x 기준 출력 예시]
-# [plugins."io.containerd.cri.v1".containerd.runtimes.nvidia]
-# (만약 1.x 버전을 사용 중이라면 "io.containerd.grpc.v1.cri"가 포함되어 나옵니다.)
+# 3. NVIDIA 런타임 분할 설정 파일 확인
+cat /etc/containerd/conf.d/99-nvidia.toml
+# 정상이라면 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia] 로 시작하는 설정 블록이 출력되어야 합니다.
 
-# (만약 위 두 명령어 중 하나라도 아무런 출력이 나오지 않는다면, 3-3 단계를 다시 천천히 실행해 주세요.)
+# (만약 위 명령어 중 하나라도 예상된 출력이 나오지 않는다면, 3-3 단계를 다시 실행해 주세요.)
 ```
 
 ---
