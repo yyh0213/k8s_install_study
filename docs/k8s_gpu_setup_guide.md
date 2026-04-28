@@ -241,13 +241,19 @@ kubectl taint nodes --all node-role.kubernetes.io/control-plane-
 ```
 
 ### **[시나리오 B] 서버 여러 대를 연결하는 경우 (다중 노드)**
-다른 서버(Worker)들을 마스터에 연결합니다.
+다른 서버(Worker)들을 마스터에 연결합니다. 기존에 연결된 워커 노드는 재등록할 필요가 없으며, 신규 워커 노드를 추가할 때만 아래 과정을 진행합니다.
 
-1. **Worker 노드에서 실행**: `kubeadm init` 완료 시 출력된 `join` 명령어를 입력합니다.
+1. **Master 노드에서 연결 명령어 발급 (최초 1회 발급된 토큰은 24시간 후 만료됨)**
+워커 노드를 붙이기 전, 마스터 노드에서 새로운 임시 토큰과 조인(join) 명령어를 발급받습니다.
+   ```bash
+   sudo kubeadm token create --print-join-command
+   ```
+   (위 명령어 실행 시 출력되는 kubeadm join ... 전체 줄을 복사합니다.)
+2. **Worker 노드에서 실행**: 복사한 `join` 명령어를 Worker 노드에서 실행합니다.
    ```bash
    sudo kubeadm join <Master-IP>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
    ```
-2. **Master 노드에서 확인**:
+3. **Master 노드에서 확인**:
    ```bash
    kubectl get nodes
    ```
