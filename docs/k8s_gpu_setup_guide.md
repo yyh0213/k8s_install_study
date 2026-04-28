@@ -156,7 +156,11 @@ grep 'SystemdCgroup = true' /etc/containerd/config.toml
 
 # 2. NVIDIA 런타임 정상 등록 여부 확인
 grep -i 'containerd.runtimes.nvidia' /etc/containerd/config.toml
-# 정상이라면 '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]' 같은 줄이 포함되어 출력되어야 합니다.
+
+# [v2.x 기준 출력 예시]
+# [plugins."io.containerd.cri.v1".containerd.runtimes.nvidia]
+# (만약 1.x 버전을 사용 중이라면 "io.containerd.grpc.v1.cri"가 포함되어 나옵니다.)
+
 # (만약 위 두 명령어 중 하나라도 아무런 출력이 나오지 않는다면, 3-3 단계를 다시 천천히 실행해 주세요.)
 ```
 
