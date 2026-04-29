@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: train-worker-1
+spec:
+  containers:
+  - name: ai-model-container
+    image: <비공개_레지스트리_경로>/model-image:latest
+    
+    # 1. Downward API를 통한 환경 변수 주입
+    env:
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+
+    volumeMounts:
+    - name: nfs-storage
+      mountPath: /app/outputs
+      # 2. NAS 루트 디렉토리 하위에 파드 이름(train-worker-1)으로 폴더를 자동 생성 및 마운트
+      subPathExpr: $(POD_NAME) 
+
+  volumes:
+  - name: nfs-storage
+    persistentVolumeClaim:
+      claimName: shared-nas-pvc

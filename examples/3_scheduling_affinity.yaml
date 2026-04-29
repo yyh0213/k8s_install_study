@@ -1,0 +1,34 @@
+# 이 YAML은 스케줄링 전략(nodeSelector 및 affinity)의 적용 예시를 보여주는 Job입니다.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ddp-job-with-affinity
+spec:
+  template:
+    metadata:
+      labels:
+        job-name: ddp-job
+    spec:
+      # 1. 특정 GPU 모델(RTX 3090)이 장착된 노드만 선택
+      nodeSelector:
+        nvidia.com/gpu.product: "NVIDIA-GeForce-RTX-3090"
+        
+      # 2. 파드 몰아주기 (네트워크 통신 최적화)
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: job-name
+                  operator: In
+                  values:
+                  - ddp-job
+              topologyKey: "kubernetes.io/hostname" # 동일한 호스트명(서버)에 우선 배치
+      
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: pytorch/pytorch:latest
+        command: ["sleep", "3600"]

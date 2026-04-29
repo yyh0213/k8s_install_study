@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ddp-job
+spec:
+  completions: 4 # 총 4개의 GPU 워커 파드 실행
+  parallelism: 4 # 4개를 동시에 실행
+  completionMode: Indexed 
+  backoffLimit: 0 # 하나라도 실패하면 학습 전체가 오염되므로 재시도 방지
+  template:
+    metadata:
+      labels:
+        job-name: ddp-job
+    spec:
+      subdomain: distributed-training-svc
+      restartPolicy: Never
+      containers:
+      - name: pytorch-worker
+        image: pytorch/pytorch:latest
+        
+        env:
+        # 분산 학습 필수 환경 변수
+        - name: MASTER_ADDR
+          value: "ddp-job-0.distributed-training-svc" # 0번 인덱스 파드를 마스터로 지정
+        - name: MASTER_PORT
+          value: "29500"
+        - name: WORLD_SIZE
+          value: "4"
+        # 파드의 인덱스 번호를 컨테이너 내부의 RANK로 매핑
+        - name: RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+
+        # 표준화된 MLOps 런너(Runner) 스크립트 실행
+        command: ["python", "-m", "torch.distributed.run"]
+        args:
+        - "--nnodes=$(WORLD_SIZE)"
+        - "--node_rank=$(RANK)"
+        - "--master_addr=$(MASTER_ADDR)"
+        - "--master_port=$(MASTER_PORT)"
+        - "custom_runner.py"

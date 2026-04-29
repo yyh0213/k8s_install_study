@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: mlops-pipeline-
+spec:
+  entrypoint: main-dag
+  
+  # 전체 워크플로에서 공통으로 사용할 볼륨 정의
+  volumes:
+  - name: shared-storage
+    persistentVolumeClaim:
+      claimName: shared-nas-pvc
+
+  templates:
+  # 파이프라인의 구조(DAG) 정의
+  - name: main-dag
+    dag:
+      tasks:
+      - name: step-1-preprocess
+        template: preprocessing-job
+        
+      - name: step-2-train
+        dependencies: [step-1-preprocess] # 전처리가 성공해야만 실행됨 ⭐
+        template: distributed-training-job
+        
+      - name: step-3-evaluate
+        dependencies: [step-2-train] # 학습이 완료되어야만 실행됨 ⭐
+        template: evaluation-job
+
+  # 각 단계별 실제 실행 컨테이너 정의 (간략화)
+  - name: preprocessing-job
+    container:
+      image: <레지스트리>/data-prep:v1
+      command: ["python", "preprocess.py"]
+      volumeMounts:
+      - name: shared-storage
+        mountPath: /data
+
+  - name: distributed-training-job
+    # (2장에서 설명한 Indexed Job 로직이 Argo 형태로 통합됨)
+    container:
+      image: <레지스트리>/train:v1
+      command: ["python", "-m", "torch.distributed.run", "train.py"]
+      volumeMounts:
+      - name: shared-storage
+        mountPath: /data
+
+  - name: evaluation-job
+    container:
+      image: <레지스트리>/eval:v1
+      command: ["python", "eval.py"]
+      volumeMounts:
+      - name: shared-storage
+        mountPath: /data
