@@ -153,7 +153,7 @@ fi
 sudo mkdir -p /etc/containerd/conf.d
 
 # 4. NVIDIA 런타임 설정 주입 (conf.d/99-nvidia.toml 파일로 생성됨)
-sudo nvidia-ctk runtime configure --runtime=containerd
+sudo nvidia-ctk runtime configure --runtime=containerd --config=/etc/containerd/conf.d/99-nvidia.toml
 
 # 5. 쿠버네티스 Cgroup 드라이버(systemd) 활성화
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -316,7 +316,16 @@ helm install gpu-operator nvidia/gpu-operator \
   --set driver.enabled=false \
   --set toolkit.enabled=false
 
-# 4. 배포 상태 확인 (모든 Pod가 Running이 될 때까지 대기)
+# 4. RuntimeClass 생성 (Host toolkit 사용으로 인해 자동 생성되지 않으므로 수동 생성 필수 ⭐)
+cat <<EOF | kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+EOF
+
+# 5. 배포 상태 확인 (모든 Pod가 Running이 될 때까지 대기)
 kubectl get pods -n gpu-operator
 ```
 
@@ -387,6 +396,7 @@ kind: Pod
 metadata:
   name: gpu-test
 spec:
+  runtimeClassName: nvidia # NVIDIA runtime 사용 명시 ⭐
   restartPolicy: OnFailure
   containers:
   - name: cuda-vector-add
@@ -448,7 +458,7 @@ kubectl create secret docker-registry harbor-registry-secret \
 *   `<HARBOR_URL>`: 사내 Harbor 주소 (예: harbor.company.com)
 
 ### 2. YAML 파일에 열쇠 명시하기
-파드 정의 시 아래와 같이 `imagePullSecrets`를 명시해야 해당 열쇠를 써서 이미지를 가져옵니다.
+파드 정의 시 아래와 같이 `imagePullSecrets` 및 GPU 런타임을 명시해야 합니다.
 
 ```yaml
 apiVersion: v1
@@ -456,6 +466,7 @@ kind: Pod
 metadata:
   name: my-ai-app
 spec:
+  runtimeClassName: nvidia # NVIDIA runtime 사용 명시 ⭐
   # 생성한 Secret 이름을 여기에 명시합니다 ⭐
   imagePullSecrets:
   - name: harbor-registry-secret
