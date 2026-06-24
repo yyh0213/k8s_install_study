@@ -21,7 +21,15 @@ sudo swapoff -a
 # /etc/fstab 파일에서 swap이 포함된 라인을 찾아 맨 앞에 주석(#)을 추가합니다.
 sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-# 3. Swap 비활성화 정상 확인 (Swap 행의 값이 모두 0이면 성공)
+# 3. systemd GPT Auto-Generator에 의한 자동 활성화 방지 (필수 ⭐)
+# Ubuntu 등 systemd 기반 OS는 /etc/fstab 주석 처리와 무관하게 swap 파티션을 자동 감지하여 활성화합니다.
+# 이를 방지하기 위해 생성된 systemd swap 유닛을 찾아 완전히 마스크(mask) 처리해야 합니다.
+# 우선 활성화된 swap 유닛을 확인합니다:
+systemctl list-units --type=swap --all
+# 예: dev-sda3.swap 와 같은 유닛이 확인되면 아래 명령어로 마스크 처리합니다.
+sudo systemctl mask <swap-unit-name>  # 예: sudo systemctl mask dev-sda3.swap
+
+# 4. Swap 비활성화 정상 확인 (Swap 행의 값이 모두 0이면 성공)
 free -h
 ```
 
@@ -274,14 +282,51 @@ watch kubectl get pods -n kube-system
 
 ---
 
-## 🎮 8단계: NVIDIA GPU Device Plugin 배포 `[MASTER]`
+## 🎮 8단계: Helm 및 NVIDIA GPU Operator 설치 `[MASTER]`
 
-K8s 클러스터가 GPU를 자원으로 인식하게 만드는 최종 단계입니다.
+NVIDIA GPU Operator는 Kubernetes 클러스터의 GPU 노드를 자동으로 관리해 주는 솔루션입니다. 여기서는 Helm을 사용하여 GPU Operator를 배포합니다.
+
+### 8-1. Helm 설치
+Kubernetes 패키지 매니저인 Helm이 설치되어 있지 않다면 아래 명령어로 설치합니다.
 
 ```bash
-# NVIDIA Device Plugin 배포
-kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml
+# Helm 설치 스크립트 다운로드 및 실행
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
+# 설치 확인
+helm version
+```
+
+### 8-2. NVIDIA GPU Operator 설치
+GPU Operator Helm 저장소를 추가하고, Host에 이미 GPU 드라이버와 Container Toolkit이 설치된 상태이므로 해당 기능의 자동 설치 옵션을 비활성화(`enabled=false`)하여 배포합니다.
+
+```bash
+# 1. NVIDIA Helm 저장소 추가 및 업데이트
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+
+# 2. GPU Operator 네임스페이스 및 권한 설정 (PSA 설정 포함)
+kubectl create namespace gpu-operator
+kubectl label --overwrite namespace gpu-operator pod-security.kubernetes.io/enforce=privileged
+
+# 3. GPU Operator 설치
+# (Host에 이미 드라이버와 툴킷이 설치된 상태이므로 driver.enabled=false, toolkit.enabled=false 설정)
+helm install gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator \
+  --set driver.enabled=false \
+  --set toolkit.enabled=false
+
+# 4. 배포 상태 확인 (모든 Pod가 Running이 될 때까지 대기)
+kubectl get pods -n gpu-operator
+```
+
+> [!NOTE]
+> 만약 Worker 노드에 NVIDIA Driver와 Container Toolkit이 설치되어 있지 않고, GPU Operator가 컨테이너 기반으로 이들을 자동 설치하도록 하려면 `--set driver.enabled=false --set toolkit.enabled=false` 옵션을 제외하고 설치해야 합니다.
+
+### 8-3. GPU 인식 확인
+GPU Operator가 정상 설치되면 쿠버네티스가 GPU를 자원으로 인식합니다.
+
+```bash
 # GPU 인식 확인
 kubectl describe node | grep -A20 "Capacity"
 # nvidia.com/gpu: <갯수> 가 보이면 성공!
@@ -378,7 +423,7 @@ Done
 | 증상 | 원인 | 해결책 |
 |------|------|--------|
 | `kubectl get nodes`에서 노드가 `NotReady` | CNI 미설치 또는 containerd 문제 | Calico 설치 확인, `sudo systemctl status containerd` |
-| GPU Pod가 `Pending` 상태 | Device Plugin 미설치 또는 GPU 노드 자원 부족 | `kubectl describe pod <pod>` 로 이벤트 메시지 확인 |
+| GPU Pod가 `Pending` 상태 | GPU Operator/Device Plugin 미설치 또는 GPU 노드 자원 부족 | `kubectl describe pod <pod>` 로 이벤트 메시지 확인 |
 | `nvidia-smi` 정상이나 컨테이너에서 GPU 미인식 | NVIDIA Container Toolkit 미설정 | `sudo nvidia-ctk runtime configure --runtime=containerd` 후 재시작 |
 | `kubeadm init` 실패 | swap이 꺼지지 않음 / containerd CRI 소켓 문제 | `swapoff -a` 재확인, `--cri-socket` 옵션 명시 |
 
