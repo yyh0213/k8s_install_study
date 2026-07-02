@@ -1,0 +1,53 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: "pytorch-ddp-test"
+  namespace: "kubeflow"
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+            command:
+            - "python"
+            - "-c"
+            - |
+              import os
+              import torch.distributed as dist
+              print("Master: PyTorch DDP 연결 초기화 시작...")
+              dist.init_process_group(
+                  backend="gloo",
+                  init_method="env://",
+                  world_size=int(os.environ["WORLD_SIZE"]),
+                  rank=int(os.environ["RANK"])
+              )
+              print(f"Master: 성공적으로 Rank {os.environ['RANK']}로 연결되었습니다!")
+              dist.destroy_process_group()
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+            command:
+            - "python"
+            - "-c"
+            - |
+              import os
+              import torch.distributed as dist
+              print("Worker: PyTorch DDP 연결 초기화 시작...")
+              dist.init_process_group(
+                  backend="gloo",
+                  init_method="env://",
+                  world_size=int(os.environ["WORLD_SIZE"]),
+                  rank=int(os.environ["RANK"])
+              )
+              print(f"Worker: 성공적으로 Rank {os.environ['RANK']}로 연결되었습니다!")
+              dist.destroy_process_group()

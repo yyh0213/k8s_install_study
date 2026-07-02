@@ -45,69 +45,138 @@ spec:
 
 ---
 
-## 2장. 다중 서버 분산 학습 네트워크 및 인덱스 구성 (PyTorch DDP)
+## 2장. Kubeflow Training Operator를 활용한 분산 학습 오케스트레이션 (PyTorchJob)
 
-K8s에서 PyTorch의 DDP(Distributed Data Parallel)를 실행하려면, 클러스터에 흩어진 컨테이너들이 **서로의 IP를 찾고(Discovery)**, **자신의 역할 번호(Rank)를 인식**해야 합니다. K8s 1.22+부터 정식 지원되는 **Indexed Job**과 **Headless Service**가 이 역할을 수행합니다.
+K8s에서 PyTorch의 DDP(Distributed Data Parallel)를 실행하려면, 클러스터에 분산된 워커들이 **서로의 IP를 발견(Discovery)**하고, **자신의 고유 역할 번호(Rank)를 인식**해야 합니다. 과거에는 이를 위해 `Indexed Job`과 `Headless Service`를 직접 설정해야 했지만, 이제는 사실상의 업계 표준인 **Kubeflow Training Operator**의 `PyTorchJob` Custom Resource를 활용하여 훨씬 안정적이고 단순하게 처리할 수 있습니다.
 
-### 2.1. 통신 계층 구축 (Headless Service)
-마스터 파드의 유동적인 IP를 고정된 도메인 네임으로 덮어씌워 워커들이 항상 마스터를 찾을 수 있게 합니다.
+### 2.1. Kubeflow Training Operator의 역할
+* **자동 네트워크 프로비저닝**: 각 레플리카(Master, Worker 등) 간의 통신을 위해 개별 Headless Service를 자동으로 생성해 줍니다.
+* **환경 변수 자동 주입**: 분산 학습에 필수적인 `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK` 등을 컨테이너 내부에 자동으로 바인딩해 줍니다.
+* **안정적인 부트스트랩**: 워커 노드가 실행될 때 마스터 노드의 DNS가 분석될 때까지 대기해 주는 init container(`init-pytorch`)를 기본 제공하여, 파드 시작 순서 불일치로 인한 조기 크래시를 원천 방지합니다.
+
+### 2.2. 분산 학습 구현 구조 (`PyTorchJob` YAML)
+아래는 총 4개의 GPU 워커(Master 1, Worker 3)를 구성하여 PyTorch DDP 학습을 실행하기 위한 `PyTorchJob` 표준 YAML 구조입니다.
+
 ```yaml
-apiVersion: v1
-kind: Service
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
 metadata:
-  name: distributed-training-svc
+  name: "pytorch-ddp-dist"
+  namespace: "kubeflow"
 spec:
-  clusterIP: None # K8s 내부 로드밸런싱을 비활성화하고 DNS 레코드만 생성
-  selector:
-    job-name: ddp-job
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            job-name: pytorch-ddp-dist
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:latest
+            # PyTorch DDP 환경 변수들이 Operator에 의해 자동 주입되므로 별도의 env 설정이 생략됩니다.
+            command: ["python", "-m", "torch.distributed.run"]
+            args:
+            - "--nnodes=$(WORLD_SIZE)"
+            - "--node_rank=$(RANK)"
+            - "--master_addr=$(MASTER_ADDR)"
+            - "--master_port=$(MASTER_PORT)"
+            - "custom_runner.py"
+            volumeMounts:
+            - name: shared-storage
+              mountPath: /data
+          volumes:
+          - name: shared-storage
+            persistentVolumeClaim:
+              claimName: shared-nas-pvc
+    Worker:
+      replicas: 3
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            job-name: pytorch-ddp-dist
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:latest
+            command: ["python", "-m", "torch.distributed.run"]
+            args:
+            - "--nnodes=$(WORLD_SIZE)"
+            - "--node_rank=$(RANK)"
+            - "--master_addr=$(MASTER_ADDR)"
+            - "--master_port=$(MASTER_PORT)"
+            - "custom_runner.py"
+            volumeMounts:
+            - name: shared-storage
+              mountPath: /data
+          volumes:
+          - name: shared-storage
+            persistentVolumeClaim:
+              claimName: shared-nas-pvc
 ```
 
-### 2.2. 분산 학습 오케스트레이션 (Indexed Job)
-`completionMode: Indexed`를 사용하여 생성되는 파드에 0번부터 순차적인 고유 인덱스를 부여합니다.
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: ddp-job
-spec:
-  completions: 4 # 총 4개의 GPU 워커 파드 실행
-  parallelism: 4 # 4개를 동시에 실행
-  completionMode: Indexed 
-  backoffLimit: 0 # 하나라도 실패하면 학습 전체가 오염되므로 재시도 방지
-  template:
-    metadata:
-      labels:
-        job-name: ddp-job
-    spec:
-      subdomain: distributed-training-svc
-      restartPolicy: Never
-      containers:
-      - name: pytorch-worker
-        image: pytorch/pytorch:latest
-        
-        env:
-        # 분산 학습 필수 환경 변수
-        - name: MASTER_ADDR
-          value: "ddp-job-0.distributed-training-svc" # 0번 인덱스 파드를 마스터로 지정
-        - name: MASTER_PORT
-          value: "29500"
-        - name: WORLD_SIZE
-          value: "4"
-        # 파드의 인덱스 번호를 컨테이너 내부의 RANK로 매핑
-        - name: RANK
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+### 2.3. 즉시 검증 가능한 실습용 매니페스트 (CPU/gloo 백엔드 활용)
+별도의 데이터 볼륨(PVC)이나 외부 Python 스크립트 파일 없이, 공식 PyTorch 이미지와 인라인 코드를 사용하여 실제 PyTorch DDP 분산 네트워크 초기화가 원활히 작동하는지 즉시 테스트해 볼 수 있는 매니페스트입니다. CPU 기반의 `gloo` 통신 백엔드를 사용하여 GPU 장치가 없는 일반 노드에서도 작동합니다.
 
-        # 표준화된 MLOps 런너(Runner) 스크립트 실행
-        command: ["python", "-m", "torch.distributed.run"]
-        args:
-        - "--nnodes=$(WORLD_SIZE)"
-        - "--node_rank=$(RANK)"
-        - "--master_addr=$(MASTER_ADDR)"
-        - "--master_port=$(MASTER_PORT)"
-        - "custom_runner.py"
+```yaml
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: "pytorch-ddp-test"
+  namespace: "kubeflow"
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+            command:
+            - "python"
+            - "-c"
+            - |
+              import os
+              import torch.distributed as dist
+              print("Master: PyTorch DDP 연결 초기화 시작...")
+              dist.init_process_group(
+                  backend="gloo",
+                  init_method="env://",
+                  world_size=int(os.environ["WORLD_SIZE"]),
+                  rank=int(os.environ["RANK"])
+              )
+              print(f"Master: 성공적으로 Rank {os.environ['RANK']}로 연결되었습니다!")
+              dist.destroy_process_group()
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+            command:
+            - "python"
+            - "-c"
+            - |
+              import os
+              import torch.distributed as dist
+              print("Worker: PyTorch DDP 연결 초기화 시작...")
+              dist.init_process_group(
+                  backend="gloo",
+                  init_method="env://",
+                  world_size=int(os.environ["WORLD_SIZE"]),
+                  rank=int(os.environ["RANK"])
+              )
+              print(f"Worker: 성공적으로 Rank {os.environ['RANK']}로 연결되었습니다!")
+              dist.destroy_process_group()
 ```
+
 
 ---
 
@@ -126,29 +195,120 @@ helm upgrade -i nvdp nvdp/nvidia-device-plugin \
 배포 후 노드의 상세 정보를 조회하면 `nvidia.com/gpu.product=NVIDIA-GeForce-RTX-3090`과 같은 구체적인 하드웨어 라벨이 자동으로 부착된 것을 확인할 수 있습니다.
 
 ### 3.2. 스케줄링 제어 (`nodeSelector` 및 `Affinity`)
-동일한 연산 능력을 가진 GPU들끼리만 묶어서 DDP Job을 할당하도록 YAML을 구성합니다. 나아가 `podAffinity`를 설정하여 파드들이 최대한 동일한 물리적 서버(스위치를 거치지 않는 로컬 버스)에 배치되도록 강제하여 통신 지연을 최소화합니다.
+동일한 연산 능력을 가진 GPU들끼리만 묶어서 PyTorchJob을 실행하도록 YAML을 구성합니다. `PyTorchJob` 스펙 하위의 `Master` 및 `Worker` 템플릿(Pod Template Spec)의 `nodeSelector`와 `affinity` 필드에 이를 적용합니다.
+
+나아가 `podAffinity`를 설정하여 파드들이 최대한 동일한 물리적 서버(스위치를 거치지 않는 로컬 버스)에 배치되도록 강제하여 통신 지연을 최소화합니다.
 
 ```yaml
-# spec 하위 설정 예시
-    spec:
-      # 1. 특정 GPU 모델(RTX 3090)이 장착된 노드만 선택
-      nodeSelector:
-        nvidia.com/gpu.product: "NVIDIA-GeForce-RTX-3090"
-        
-      # 2. 파드 몰아주기 (네트워크 통신 최적화)
-      affinity:
-        podAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchExpressions:
-                - key: job-name
-                  operator: In
-                  values:
-                  - ddp-job
-              topologyKey: "kubernetes.io/hostname" # 동일한 호스트명(서버)에 우선 배치
+# PyTorchJob spec 하위 replicaSpecs 예시
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template:
+        spec:
+          # 1. 마스터 파드를 특정 GPU 모델(RTX 3090)이 장착된 노드에 할당
+          nodeSelector:
+            nvidia.com/gpu.product: "NVIDIA-GeForce-RTX-3090"
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:latest
+            # 생략...
+    Worker:
+      replicas: 3
+      template:
+        spec:
+          # 2. 워커 파드도 마스터와 동일한 GPU 모델(RTX 3090)이 장착된 노드에 할당 (병목 방지)
+          nodeSelector:
+            nvidia.com/gpu.product: "NVIDIA-GeForce-RTX-3090"
+            
+          # 3. 파드 몰아주기 (네트워크 통신 최적화)
+          # Master 파드와 동일한 호스트명(서버)에 우선적으로 배치하도록 스케줄러 유도
+          affinity:
+            podAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchExpressions:
+                    - key: training.kubeflow.org/job-name
+                      operator: In
+                      values:
+                      - pytorch-ddp-dist
+                  topologyKey: "kubernetes.io/hostname" # 동일 호스트에 우선 순위 부여
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:latest
+            # 생략...
 ```
+
+### 3.3. 다중 GPU 모델 선택 및 특정 VRAM 크기 기준 스케줄링 (`nodeAffinity`)
+
+`nodeSelector`는 1대1 매핑(예: GPU 제품명은 반드시 RTX 3090이어야 함)만 가능합니다. 하지만 **Node Affinity (`nodeAffinity`)**를 활용하면 복수의 GPU 모델을 선택하거나, 특정 VRAM 크기(GB) 이상을 가진 GPU만 필터링하여 스케줄링할 수 있습니다.
+
+#### 1) 여러 특정 GPU 모델 중 하나를 임의로 선택할 경우 (OR 연산)
+`RTX 3090` 또는 `RTX A5000` 등 연산 성능과 메모리 크기가 유사한 복수의 이기종 GPU를 함께 사용하려 할 때는 `In` 연산자를 사용합니다.
+```yaml
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                    - "NVIDIA-GeForce-RTX-3090"
+                    - "NVIDIA-RTX-A5000"
+```
+
+#### 2) 특정 VRAM 크기(예: 24GB) 이상을 가진 GPU 노드만 선택할 경우
+NVIDIA GPU Feature Discovery(GFD)는 GPU의 VRAM 메모리 용량 정보를 MiB 단위의 라벨(`nvidia.com/gpu.memory`)로 제공합니다. (예: 24GB VRAM = 24576MiB)
+
+* **방법 A: `Gt`(Greater Than) 연산자 활용**
+  쿠버네티스의 노드 어피니티는 숫자형 비교 연산자인 `Gt`를 제공하므로, 특정 메모리 용량 초과인 노드만 필터링할 수 있습니다.
+  ```yaml
+  spec:
+    pytorchReplicaSpecs:
+      Worker:
+        template:
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: nvidia.com/gpu.memory
+                      operator: Gt
+                      values:
+                      - "20000" # 20000MiB(약 20GB) 초과의 VRAM 노드만 매핑
+  ```
+
+* **방법 B: 특정 대용량 VRAM 규격 명시 (`In` 연산자)**
+  정확한 용량 매칭을 원할 때는 24GB 이상의 주요 VRAM 규격(24GB, 40GB, 48GB, 80GB 등)을 명시적으로 나열하여 매칭합니다.
+  ```yaml
+  spec:
+    pytorchReplicaSpecs:
+      Worker:
+        template:
+          spec:
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: nvidia.com/gpu.memory
+                      operator: In
+                      values:
+                      - "24576" # 24GB
+                      - "40960" # 40GB
+                      - "49152" # 48GB
+                      - "81920" # 80GB
+  ```
 
 ---
 
@@ -216,13 +376,51 @@ spec:
         mountPath: /data
 
   - name: distributed-training-job
-    # (2장에서 설명한 Indexed Job 로직이 Argo 형태로 통합됨)
-    container:
-      image: <레지스트리>/train:v1
-      command: ["python", "-m", "torch.distributed.run", "train.py"]
-      volumeMounts:
-      - name: shared-storage
-        mountPath: /data
+    # 2장에서 설명한 Kubeflow Training Operator의 PyTorchJob을 생성하는 리소스 템플릿
+    resource:
+      action: create
+      successCondition: status.conditions[*].status == True && status.conditions[*].type == Succeeded
+      failureCondition: status.conditions[*].status == True && status.conditions[*].type == Failed
+      manifest: |
+        apiVersion: kubeflow.org/v1
+        kind: PyTorchJob
+        metadata:
+          generateName: pytorch-ddp-dist-
+          namespace: kubeflow
+        spec:
+          pytorchReplicaSpecs:
+            Master:
+              replicas: 1
+              restartPolicy: OnFailure
+              template:
+                spec:
+                  containers:
+                  - name: pytorch
+                    image: <레지스트리>/train:v1
+                    command: ["python", "-m", "torch.distributed.run", "train.py"]
+                    volumeMounts:
+                    - name: shared-storage
+                      mountPath: /data
+                  volumes:
+                  - name: shared-storage
+                    persistentVolumeClaim:
+                      claimName: shared-nas-pvc
+            Worker:
+              replicas: 3
+              restartPolicy: OnFailure
+              template:
+                spec:
+                  containers:
+                  - name: pytorch
+                    image: <레지스트리>/train:v1
+                    command: ["python", "-m", "torch.distributed.run", "train.py"]
+                    volumeMounts:
+                    - name: shared-storage
+                      mountPath: /data
+                  volumes:
+                  - name: shared-storage
+                    persistentVolumeClaim:
+                      claimName: shared-nas-pvc
 
   - name: evaluation-job
     container:
@@ -235,6 +433,6 @@ spec:
 
 ### 💡 매뉴얼 요약 및 엔지니어링 체크포인트
 1. **격리성 확보**: 파드별 동적 볼륨 마운트(`subPathExpr`)를 통해 데이터 덮어쓰기 로직을 인프라 단에서 완전히 분리하십시오.
-2. **네트워크 안정성**: Headless Service와 Indexed Job의 조합은 PyTorch DDP를 위한 가장 완벽한 K8s 네이티브 솔루션입니다.
+2. **분산 오케스트레이션 자동화**: Kubeflow Training Operator(PyTorchJob)를 활용하면 통신 인프라 구축, 네트워킹 설정 및 파드 인덱스 매핑이 자동화되어 오류를 대폭 경감합니다.
 3. **자원 최적화**: 3090, 4060 등 서버별 하드웨어 스펙을 K8s가 명확히 인지하도록 `nodeSelector`를 구성하여 GPU 낭비를 차단하십시오.
 4. **표준화**: 단일 스크립트를 수동으로 실행하는 단계를 벗어나, 모든 프로세스를 컨테이너 단위로 분할하고 Argo Workflows와 같은 도구를 통해 DAG로 연결하면 완성도 높은 MLOps 시스템이 구축됩니다. 이 과정에서 직접 개발한 런너 모듈을 활용하면 유지보수성이 극대화될 것입니다.

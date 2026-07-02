@@ -1,0 +1,48 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: "pytorch-simple"
+  namespace: "kubeflow"
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: python:3.10-slim
+              command:
+                - "python"
+                - "-c"
+                - |
+                  import os
+                  import time
+                  print("Master replica is starting...")
+                  print(f"MASTER_ADDR: {os.environ.get('MASTER_ADDR')}")
+                  print(f"MASTER_PORT: {os.environ.get('MASTER_PORT')}")
+                  print(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
+                  print(f"RANK: {os.environ.get('RANK')}")
+                  print("Master replica is sleeping for 45s to allow worker to connect...")
+                  time.sleep(45)
+                  print("Master replica completed.")
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: python:3.10-slim
+              command:
+                - "python"
+                - "-c"
+                - |
+                  import os
+                  import time
+                  print("Worker replica is active.")
+                  print(f"RANK: {os.environ.get('RANK')}")
+                  print("Worker replica is sleeping for 30s...")
+                  time.sleep(30)
+                  print("Worker replica completed.")
