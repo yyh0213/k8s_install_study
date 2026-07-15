@@ -1,0 +1,316 @@
+# 1. 쿠버네티스 API 그룹 및 리소스 종류 정의
+apiVersion: "kubeflow.org/v1"   # Kubeflow Training Operator(KTO) v1 규칙을 사용함
+kind: "PyTorchJob"              # 일반 Pod가 아닌, 분산 학습을 전담하는 커스텀 리소스 선언
+metadata:
+  name: "detectron-ddp-job"     # 리소스 고유 이름 (쿠버네티스 표준에 따라 언더바(_) 금지, 대시(-) 사용)
+  namespace: "default"          # 분산 학습 작업이 실행될 가상 네임스페이스 그룹
+spec:
+  # 2. Kubeflow 전용 분산 학습 그룹 명시
+  pytorchReplicaSpecs:
+
+    # ==================== [ 마스터 노드 정의 ] ====================
+    Master:
+      replicas: 1               # 분산 학습의 메인 컨트롤러 역할을 할 랭크 0(Rank 0) Pod 개수 (보통 1개)
+      restartPolicy: Never      # 학습 에러 발생 시 자동 재기동하지 않고 즉시 작업을 실패(Failed) 처리하여 상태 보존
+      template:
+        metadata:
+          labels:
+            job-name: pytorch-ddp-dist # 분산 학습 파드들을 묶어주는 논리적 식별 라벨
+        spec:
+          # ------------------------------------------------------------------
+          # 3. 초기화 컨테이너(initContainer): 메인 학습 컨테이너가 뜨기 전에
+          #    NAS(NFS)에 있는 원본 데이터셋을 로컬 SSD(emptyDir)로 미리 복사해둠.
+          #    -> 학습 도중 반복적으로 발생하는 NAS I/O(특히 DataLoader의 랜덤 접근)를
+          #       제거해서 NCCL collective timeout 등 통신 hang 문제를 회피하기 위함.
+          #    -> 'ori_json' 폴더는 학습에 불필요한 원본 라벨 백업이므로 복사 대상에서 제외.
+          # ------------------------------------------------------------------
+          initContainers:
+          - name: copy-dataset
+            image: private-registry.domain.com/ai-team/detectron2:latest
+            command:
+            - "python3"
+            - "-c"
+            - |
+              import os, shutil
+              src = "/nas/project/dataset"
+              dst = "/local/project/dataset"
+
+              print("[1/2] Scanning NAS file list (excluding 'ori_json')...", flush=True)
+              files_to_copy = []
+              for root, dirs, files in os.walk(src):
+                  if 'ori_json' in root.split(os.sep):
+                      continue
+                  for f in files:
+                      files_to_copy.append(os.path.join(root, f))
+
+              total = len(files_to_copy)
+              print(f"[2/2] Starting file copy to Local SSD (Total: {total} files)...", flush=True)
+
+              for i, f in enumerate(files_to_copy, 1):
+                  rel_path = os.path.relpath(f, src)
+                  target_path = os.path.join(dst, rel_path)
+                  os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                  shutil.copy2(f, target_path)
+                  if i % 200 == 0 or i == total:
+                      print(f" -> Progress: {i}/{total} files copied ({i/total*100:.1f}%)", flush=True)
+              print("Dataset local copy completed successfully!", flush=True)
+            volumeMounts:
+            - name: datasets-storage  # 원본 NAS 마운트 (읽기 전용 소스)
+              mountPath: /nas
+            - name: local-storage     # 빈 로컬 마운트 (복사 대상)
+              mountPath: /local
+
+          containers:
+          # 🚨 중요: KTO 웹훅 규칙에 따라 메인 컨테이너 이름은 반드시 'pytorch'여야 함
+          - name: pytorch
+            image: private-registry.domain.com/ai-team/detectron2:latest
+
+            # ------------------------------------------------------------------
+            # 4. [핵심 수정] 컨테이너 구동 방식을 bash 스크립트로 감싸서 사용.
+            #    학습이 끝난 뒤 sync-sidecar 컨테이너에게 "학습 종료" 신호(마커 파일)를
+            #    남겨주기 위함이며, 학습이 실패하더라도(0이 아닌 exit code) sidecar가
+            #    무한정 대기하지 않도록 반드시 마커 파일을 남기고 종료함.
+            # ------------------------------------------------------------------
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -e
+              /root/miniconda3/envs/detectron2/bin/python -u /app/detectron_train_multi_node.py \
+                --input=/data/datasets/project/dataset \
+                --save_path=/data/local_results/detectron2_results \
+                --learning_rate=0.00025 \
+                --num_classes=6 \
+                --max_iter=40000 \
+                --steps=25000,35000 \
+                --batch_size=4 || TRAIN_EXIT=$?
+              # 학습이 정상 종료됐으면 TRAIN_EXIT는 비어있으므로 0으로 기본값 처리
+              TRAIN_EXIT=${TRAIN_EXIT:-0}
+              # 학습 성공/실패 여부와 무관하게 sync-sidecar가 루프를 빠져나올 수 있도록
+              # 반드시 마커 파일을 생성 (set -e에 의해 스크립트가 중간에 죽더라도
+              # 위 || 처리 덕분에 이 지점까지는 항상 도달함)
+              touch /data/local_results/TRAINING_DONE
+              exit ${TRAIN_EXIT}
+
+            # ------------------------------------------------------------------
+            # 5. NCCL 통신 관련 환경변수
+            #    Master/Worker 양쪽 모두 동일하게 통일하여 설정 (예전에 값이 서로
+            #    달라 발생했던 원인불명 통신 이슈를 예방)
+            # ------------------------------------------------------------------
+            env:
+            - name: NCCL_IB_DISABLE
+              value: "1"                         # 인피니밴드가 없다면 강제로 끄고 일반 TCP 소켓 통신 사용
+            - name: NCCL_P2P_DISABLE
+              value: "1"                         # [필수] 동일 노드 내 GPU 간 P2P 무한 대기 버그 차단
+            - name: NCCL_SOCKET_IFNAME
+              value: "^lo,docker0"               # [필수] 경량 테스트에서 검증 완료된 안전한 네트워크 타겟팅
+            - name: NCCL_DEBUG
+              value: "INFO"                      # 통신 문제 재발 시 상세 로그를 남기도록 설정
+
+            resources:
+              limits:
+                nvidia.com/gpu: "2"               # 노드당 2 GPU 설정 유지
+              requests:
+                nvidia.com/gpu: "2"
+
+            volumeMounts:
+            - name: local-storage
+              mountPath: /data/datasets    # initContainer가 NAS에서 미리 복사해 둔 로컬 데이터셋 마운트
+            - name: local-results          # [신규] 체크포인트/평가 결과를 저장할 로컬(emptyDir) 볼륨
+              mountPath: /data/local_results
+              # -> save_path를 NAS가 아닌 이 로컬 경로로 지정한 이유:
+              #    torch.save()의 pickle 저장 방식은 작은 단위의 write가 매우 많이
+              #    발생하는데, 이를 NFS(NAS)에 직접 쓰면 latency 누적으로 인해
+              #    체크포인트 저장이 극도로 느려지고(심할 경우 초당 수십 KB),
+              #    그 동안 학습 프로세스(rank 0)가 블로킹되어 NCCL allreduce
+              #    타임아웃(30분) 및 전체 Job hang으로 이어짐. 로컬 SSD에 저장하면
+              #    이 문제가 원천 차단됨.
+            - name: dshm
+              mountPath: /dev/shm         # PyTorch DataLoader 멀티프로세싱용 공유메모리 (부족 시 DDP 크래시 방지)
+
+          # ------------------------------------------------------------------
+          # 6. [신규 추가] sync-sidecar 컨테이너
+          #    학습 컨테이너(pytorch)와 같은 Pod 안에서 나란히 실행되며,
+          #    로컬(emptyDir)에 저장된 체크포인트/결과물을 주기적으로 NAS(NFS)에
+          #    동기화함. rsync 바이너리가 이미지에 없으므로 순수 파이썬으로
+          #    "변경된 파일만 재복사"하는 얕은 동기화 로직을 직접 구현.
+          #    -> 학습 도중에도 NAS에서 중간 가중치를 확인할 수 있게 해주며,
+          #       동기화 작업이 학습 루프(NCCL collective)와 완전히 분리되어 있어
+          #       NAS I/O가 느려지더라도 학습 프로세스를 블로킹하지 않음.
+          # ------------------------------------------------------------------
+          - name: sync-sidecar
+            image: private-registry.domain.com/ai-team/detectron2:latest
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              python3 -u -c "
+              import os, shutil, time, sys
+
+              src = '/data/local_results/detectron2_results'   # 학습 컨테이너가 쓰는 로컬 결과 경로
+              dst = '/data/results/detectron2_results'         # NAS 상의 최종 보관 경로
+              marker = '/data/local_results/TRAINING_DONE'    # 학습 컨테이너가 남기는 종료 신호 파일
+
+              def sync_once():
+                  # src -> dst로 파일을 재귀적으로 복사하되,
+                  # 크기+수정시각이 동일하면 이미 복사된 것으로 간주하고 건너뜀
+                  # (rsync -a의 '변경분만 전송' 동작을 얕게 흉내낸 것)
+                  copied, skipped, failed = 0, 0, 0
+                  os.makedirs(dst, exist_ok=True)
+                  for root, dirs, files in os.walk(src):
+                      rel_dir = os.path.relpath(root, src)
+                      target_dir = os.path.join(dst, rel_dir) if rel_dir != '.' else dst
+                      os.makedirs(target_dir, exist_ok=True)
+                      for f in files:
+                          s = os.path.join(root, f)
+                          d = os.path.join(target_dir, f)
+                          try:
+                              if os.path.exists(d):
+                                  s_stat, d_stat = os.stat(s), os.stat(d)
+                                  if s_stat.st_size == d_stat.st_size and int(s_stat.st_mtime) <= int(d_stat.st_mtime):
+                                      skipped += 1
+                                      continue
+                              shutil.copy2(s, d)
+                              copied += 1
+                          except Exception as e:
+                              print(f'[Sidecar] Failed to copy {s}: {e}', flush=True)
+                              failed += 1
+                  print(f'[Sidecar] Sync done. copied={copied}, skipped={skipped}, failed={failed}', flush=True)
+
+              print('[Sidecar] Periodic sync started.', flush=True)
+              # 학습 컨테이너가 TRAINING_DONE 마커를 남기기 전까지 2분 주기로 계속 동기화
+              while not os.path.exists(marker):
+                  try:
+                      sync_once()
+                  except Exception as e:
+                      print(f'[Sidecar] sync_once failed: {e}', flush=True)
+                  time.sleep(120)
+
+              # 학습 종료 감지 -> 마지막 완전한 상태를 한 번 더 동기화 후 스스로 종료
+              # (Pod가 Succeeded로 판정되려면 이 컨테이너도 반드시 종료되어야 함)
+              print('[Sidecar] Training done detected. Performing final sync.', flush=True)
+              sync_once()
+              print('[Sidecar] Final sync completed. Exiting.', flush=True)
+              "
+            volumeMounts:
+            - name: local-results
+              mountPath: /data/local_results  # 학습 컨테이너와 동일한 emptyDir을 공유 (같은 Pod라서 가능)
+            - name: results-storage
+              mountPath: /data/results        # 최종적으로 결과물이 보관될 NAS(NFS) 마운트
+
+          # ------------------------------------------------------------------
+          # 7. Pod 레벨 스토리지 자원 정의
+          # ------------------------------------------------------------------
+          volumes:
+          - name: datasets-storage
+            persistentVolumeClaim:
+              claimName: nas-models-pvc  # 원본 데이터셋용 NAS PVC (initContainer가 읽어감)
+          - name: results-storage
+            persistentVolumeClaim:
+              claimName: nas-results-pvc     # 최종 결과 보관용 NAS PVC (sync-sidecar가 씀)
+          - name: local-storage
+            emptyDir: {}                     # 데이터셋 로컬 복사본 (Pod 삭제 시 함께 소멸)
+          - name: local-results
+            emptyDir: {}                     # 체크포인트/평가결과 로컬 임시 저장소 (pytorch, sync-sidecar가 공유)
+          - name: dshm
+            emptyDir:
+              medium: Memory                 # /dev/shm을 메모리 기반으로 별도 확보 (기본 64MB 한도 회피)
+
+    # ==================== [ 워커 노드 정의 ] ====================
+    Worker:
+      replicas: 1               # 분산 학습에 참여할 일꾼(Worker) Pod 개수
+      restartPolicy: Never      # 워커 노드가 튕기면 분산 학습 정합성을 위해 전체 작업을 즉시 중단
+      template:
+        metadata:
+          labels:
+            job-name: pytorch-ddp-dist
+        spec:
+          # Worker도 Master와 동일하게 데이터셋을 NAS에서 로컬로 미리 복사
+          # (같은 학습 데이터를 각 노드가 각자 로컬로 들고 있어야 하므로 동일 로직 필요)
+          initContainers:
+          - name: copy-dataset
+            image: private-registry.domain.com/ai-team/detectron2:latest
+            command:
+            - "python3"
+            - "-c"
+            - |
+              import os, shutil
+              src = "/nas/project/dataset"
+              dst = "/local/project/dataset"
+
+              print("[1/2] Scanning NAS file list (excluding 'ori_json')...", flush=True)
+              files_to_copy = []
+              for root, dirs, files in os.walk(src):
+                  if 'ori_json' in root.split(os.sep):
+                      continue
+                  for f in files:
+                      files_to_copy.append(os.path.join(root, f))
+
+              total = len(files_to_copy)
+              print(f"[2/2] Starting file copy to Local SSD (Total: {total} files)...", flush=True)
+
+              for i, f in enumerate(files_to_copy, 1):
+                  rel_path = os.path.relpath(f, src)
+                  target_path = os.path.join(dst, rel_path)
+                  os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                  shutil.copy2(f, target_path)
+                  if i % 200 == 0 or i == total:
+                      print(f" -> Progress: {i}/{total} files copied ({i/total*100:.1f}%)", flush=True)
+              print("Dataset local copy completed successfully!", flush=True)
+            volumeMounts:
+            - name: datasets-storage
+              mountPath: /nas
+            - name: local-storage
+              mountPath: /local
+
+          containers:
+          # 🚨 중요: 워커 영역 역시 메인 컨테이너 이름은 무조건 'pytorch'로 일치시켜야 함
+          - name: pytorch
+            image: private-registry.domain.com/ai-team/detectron2:latest
+            # Worker는 rank 0(main process)이 아니므로 체크포인트/eval 결과를
+            # 직접 저장하지 않음. 따라서 Master처럼 bash 래핑이나 sidecar 없이
+            # 학습 스크립트를 곧바로 실행해도 무방함.
+            command: ["/root/miniconda3/envs/detectron2/bin/python", "-u", "/app/detectron_train_multi_node.py"]
+            env:
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
+              value: "1"                         # [필수] 동일 노드 내 GPU 간 P2P 무한 대기 버그 차단 (Master와 동일하게 통일)
+            - name: NCCL_SOCKET_IFNAME
+              value: "^lo,docker0"               # [필수] 검증 완료된 소켓 필터링 (Master와 동일하게 통일)
+            - name: NCCL_DEBUG
+              value: "INFO"
+            args:
+            - "--input=/data/datasets/project/dataset"
+            - "--save_path=/data/local_results/detectron2_results"  # Worker도 로컬 경로 사용 (NAS 불필요한 쓰기 방지)
+            - "--learning_rate=0.00025"       # 기본 학습률 제어 (world_size에 따라 내부적으로 자동 스케일링됨)
+            - "--num_classes=6"              # 클래스 개수 지정
+            - "--max_iter=40000"             # 최대 반복 횟수 제어
+            - "--steps=25000,35000"          # 쉼표(,)를 통해 복수의 스텝 인자값을 깔끔하게 전달 가능
+            - "--batch_size=4"               # 한 개 GPU당 가져갈 이미지 개수
+            resources:
+              limits:
+                nvidia.com/gpu: "2"
+              requests:
+                nvidia.com/gpu: "2"
+            volumeMounts:
+            - name: local-storage
+              mountPath: /data/datasets
+            - name: results-storage
+              mountPath: /data/results        # Worker는 실질적으로 여기에 쓰지 않지만 인자 호환을 위해 마운트 유지
+            - name: local-results
+              mountPath: /data/local_results
+            - name: dshm
+              mountPath: /dev/shm
+          volumes:
+          - name: datasets-storage
+            persistentVolumeClaim:
+              claimName: nas-models-pvc
+          - name: results-storage
+            persistentVolumeClaim:
+              claimName: nas-results-pvc
+          - name: local-storage
+            emptyDir: {}
+          - name: local-results
+            emptyDir: {}
+          - name: dshm
+            emptyDir:
+              medium: Memory
