@@ -145,8 +145,8 @@ containerd config default | sudo tee /etc/containerd/config.toml
 
 # 2. config.toml 파일에 imports 구문이 있는지 확인 및 추가 (중요)
 # 최신 containerd는 보통 기본 포함되어 있으나, 확실히 하기 위해 실행합니다.
-if ! grep -q 'imports = \["/etc/containerd/conf.d/\*.toml"\]' /etc/containerd/config.toml; then
-  sudo sed -i '1s/^/imports = ["\/etc\/containerd\/conf.d\/*.toml"]\n/' /etc/containerd/config.toml
+if ! grep -q 'imports = \['/etc/containerd/conf.d/\*.toml'\]' /etc/containerd/config.toml; then
+  sudo sed -i '1s/^/imports = ['\/etc\/containerd\/conf.d\/*.toml']\n/' /etc/containerd/config.toml
 fi
 
 # 3. conf.d 디렉토리 생성
